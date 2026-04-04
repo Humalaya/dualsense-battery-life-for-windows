@@ -1,0 +1,17 @@
+{
+  "genel": {
+    "seconds_per_step": null,
+    "sample_count": 0,
+    "last_updated": null
+  },
+  "bluethooth": {
+    "seconds_per_step": null,
+    "sample_count": 0,
+    "last_updated": null
+  },
+  "usb": {
+    "seconds_per_step": null,
+    "sample_count": 0,
+    "last_updated": null
+  }
+}

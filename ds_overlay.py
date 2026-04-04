@@ -1,142 +1,332 @@
-import tkinter as tk
+import time
+import os
+import threading
+from collections import deque
+
+import keyboard
 from pydualsense import pydualsense
 from pydualsense.enums import BatteryState
-import winsound
-import screeninfo
 
-from icons import TAM_B64, YARIM_B64, AZ_B64, BOS_B64
+from battery_notification import BatteryNotificationUI
 
-# --- AYARLAR ---
-GUNCELLEME_SURESI = 3000 # Kontrolü 3 saniyeye düşürdük (daha hızlı tepki)
-GIZLEME_SURESI = 7000 
-FADE_HIZI = 50
+# =========================
+# AYARLAR
+# =========================
+LOG_DOSYASI = "sarj_gecmisi.txt"
+GUNCELLEME_ARALIGI = 5
+LOG_ARALIGI = 30
+MAX_KAYIT = 500
+MAX_LOG_YASI = 60 * 60 * 12
 
-class DualSenseHUD:
+HOTKEY_DURUM = "F8"
+HOTKEY_TEMIZLE = "F9"
+HOTKEY_CIKIS = "esc"
+
+BILDIRIM_SURESI = 5000
+DEBUG = True
+
+UYARI_ESIKLERI = [30, 15, 5]
+
+
+def terminali_temizle():
+    os.system("cls" if os.name == "nt" else "clear")
+
+
+class DualSenseMonitor:
     def __init__(self):
-        self.root = tk.Tk()
         self.ds = pydualsense()
-        
-        # HAFIZA SİSTEMİ
-        self.eski_pil = -1
-        self.eski_sarj_ham_durum = None # Enum değerini direkt tutacağız
-        self.baglanti_durumu = False
-        self.ilk_acilis = True
-        self.gizleme_id = None
-        
-        self.root.attributes('-topmost', True)
-        self.root.overrideredirect(True)
-        self.root.attributes('-alpha', 0.0)
-        self.root.configure(bg='#1A1A1A')
+        self.bagli = False
 
+        self.sarj_gecmisi = deque(maxlen=MAX_KAYIT)
+        self.son_log_zamani = 0
+
+        self.son_pil = None
+        self.son_durum = None
+
+        self.lock = threading.Lock()
+        self.uyari_verildi = set()
+        self.bekleyen_uyari = None
+
+        self.log_yukle()
+
+    def baglan(self):
+        if not self.bagli:
+            self.ds.init()
+            self.bagli = True
+
+    def kapat(self):
         try:
-            monitor = screeninfo.get_monitors()[0]
-            self.root.geometry(f"+{monitor.width - 220}+50")
-        except:
-            self.root.geometry("+1600+50")
-
-        self.ikon_tam = tk.PhotoImage(data=TAM_B64)
-        self.ikon_yarim = tk.PhotoImage(data=YARIM_B64)
-        self.ikon_az = tk.PhotoImage(data=AZ_B64)
-        self.ikon_bos = tk.PhotoImage(data=BOS_B64)
-
-        self.label = tk.Label(self.root, text="", font=("Consolas", 11, "bold"), bg="#1A1A1A", fg="white", pady=5)
-        self.label.pack()
-
-        self.dongu()
-        self.root.mainloop()
-
-    def fade_in(self, alpha=0.0):
-        if alpha < 0.9:
-            alpha += 0.1
-            self.root.attributes('-alpha', alpha)
-            self.root.after(FADE_HIZI, self.fade_in, alpha)
-
-    def fade_out(self, alpha=0.9):
-        if alpha > 0.0:
-            alpha -= 0.1
-            self.root.attributes('-alpha', alpha)
-            self.root.after(FADE_HIZI, self.fade_out, alpha)
-
-    def gizle(self):
-        self.fade_out()
-        self.gizleme_id = None
-
-    def dongu(self):
-        try:
-            # 1. Ham Verileri Çek
-            if not self.baglanti_durumu:
-                self.ds.init()
-                self.baglanti_durumu = True
-
-            pil = self.ds.battery.Level
-            sarj_ham = self.ds.battery.State # Enum: Charging, Discharging, Full vb.
-            
-            # Şarjda mı kontrolü (Charging veya Full ise True)
-            su_an_sarj = (sarj_ham == BatteryState.POWER_SUPPLY_STATUS_CHARGING or 
-                         sarj_ham == BatteryState.POWER_SUPPLY_STATUS_FULL)
-
-            # 2. Değişim Analizi
-            # Herhangi bir durum değişikliği (pil değişimi, kablo takılması VEYA çıkarılması)
-            durum_degisti = (pil != self.eski_pil) or (sarj_ham != self.eski_sarj_ham_durum)
-            
-            # 3. Görsel Hazırlık
-            secilen_ikon = self.ikon_tam
-            text, color = f"%{pil} ", "white"
-
-            if su_an_sarj:
-                text, color = f"⚡ %{pil} Şarj Oluyor", "#F1C40F"
-                secilen_ikon = self.ikon_tam 
-            elif pil >= 70: secilen_ikon = self.ikon_tam
-            elif pil >= 45: secilen_ikon = self.ikon_yarim
-            elif pil >= 15: secilen_ikon = self.ikon_az
-            else:
-                text, color = f"⚠️ %{pil} PİL KRİTİK!", "#E74C3C"
-                secilen_ikon = self.ikon_bos
-
-            self.label.config(image=secilen_ikon, text=text, fg=color, compound="top")
-            
-            # 4. Tetikleme Kuralları
-            kritik = (pil <= 15 and not su_an_sarj)
-            
-            if durum_degisti or self.ilk_acilis or kritik:
-                # Sadece Şarj TAKILDIĞINDA veya ilk bağlantıda ses çal
-                kablo_takildi = (sarj_ham == BatteryState.POWER_SUPPLY_STATUS_CHARGING and 
-                                self.eski_sarj_ham_durum != BatteryState.POWER_SUPPLY_STATUS_CHARGING)
-                
-                if self.ilk_acilis or kablo_takildi or (kritik and self.eski_pil > 15):
-                    winsound.PlaySound("SystemNotification", winsound.SND_ALIAS)
-
-                # Paneli uyandır
-                if self.root.attributes('-alpha') < 0.2:
-                    self.fade_in()
-
-                # Sayaç yönetimi
-                if self.gizleme_id:
-                    self.root.after_cancel(self.gizleme_id)
-                
-                if not kritik:
-                    self.gizleme_id = self.root.after(GIZLEME_SURESI, self.gizle)
-
-                self.ilk_acilis = False
-
-            # Hafızayı Güncelle
-            self.eski_pil = pil
-            self.eski_sarj_ham_durum = sarj_ham
-
+            self.ds.close()
         except Exception:
-            # Hata varsa (Bağlantı koptuysa)
-            if self.baglanti_durumu:
-                self.baglanti_durumu = False
-                self.eski_sarj_ham_durum = None
-                self.label.config(image='', text="🎮 Bağlantı Koptu", fg="#95A5A6")
-                self.fade_in()
-                if self.gizleme_id: self.root.after_cancel(self.gizleme_id)
-                self.gizleme_id = self.root.after(4000, self.gizle)
+            pass
+        self.bagli = False
 
-            try: self.ds.close()
-            except: pass
+    def pil_seviyesi_kategori(self, pil):
+        if pil >= 80:
+            return "tam"
+        elif 30 < pil < 80:
+            return "yarim"
+        elif 5 < pil <= 30:
+            return "az"
+        else:
+            return "bos"
 
-        self.root.after(GUNCELLEME_SURESI, self.dongu)
+    def log_kaydet(self, zaman, pil, durum):
+        try:
+            with open(LOG_DOSYASI, "a", encoding="utf-8") as f:
+                f.write(f"{zaman},{pil},{int(durum)}\n")
+        except Exception:
+            pass
+
+    def log_yukle(self):
+        if not os.path.exists(LOG_DOSYASI):
+            return
+
+        try:
+            with open(LOG_DOSYASI, "r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        parcalar = line.strip().split(",")
+                        if len(parcalar) >= 3:
+                            zaman = float(parcalar[0])
+                            pil = int(parcalar[1])
+                            durum = int(parcalar[2])
+                            self.sarj_gecmisi.append((zaman, pil, durum))
+                            self.son_log_zamani = max(self.son_log_zamani, zaman)
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+    def log_temizle(self):
+        with self.lock:
+            self.sarj_gecmisi.clear()
+            self.son_log_zamani = 0
+            try:
+                with open(LOG_DOSYASI, "w", encoding="utf-8") as f:
+                    f.write("")
+            except Exception:
+                pass
+
+    def loga_ekle(self, zaman, pil, durum, zorla=False):
+        if zorla or (zaman - self.son_log_zamani >= LOG_ARALIGI):
+            self.sarj_gecmisi.append((zaman, pil, int(durum)))
+            self.log_kaydet(zaman, pil, durum)
+            self.son_log_zamani = zaman
+
+    def eski_kayitlari_ayikla(self, simdi):
+        temiz = deque(maxlen=MAX_KAYIT)
+        for zaman, pil, durum in self.sarj_gecmisi:
+            if simdi - zaman <= MAX_LOG_YASI:
+                temiz.append((zaman, pil, durum))
+        self.sarj_gecmisi = temiz
+
+    def pil_ve_durum_oku(self):
+        pil = self.ds.battery.Level
+        durum = self.ds.battery.State
+        return pil, durum
+
+    def enum_adi(self, durum):
+        try:
+            return BatteryState(durum).name
+        except Exception:
+            return str(durum)
+
+    def durum_metni(self, durum, pil):
+        if durum == BatteryState.POWER_SUPPLY_STATUS_CHARGING:
+            return "Şarj oluyor"
+        if durum == BatteryState.POWER_SUPPLY_STATUS_FULL or pil >= 100:
+            return "Tam dolu"
+        if pil <= 15:
+            return "Pil kritik"
+        return "Kablosuz mod"
+
+    def baglanti_metni(self, durum, pil):
+        if durum == BatteryState.POWER_SUPPLY_STATUS_CHARGING:
+            return "USB bağlı"
+        if durum == BatteryState.POWER_SUPPLY_STATUS_FULL or pil >= 100:
+            return "USB bağlı"
+        return "Bluetooth"
+
+    def zamani_formatla(self, saniye):
+        saniye = max(0, int(saniye))
+        saat = saniye // 3600
+        dakika = (saniye % 3600) // 60
+
+        if saat > 0:
+            return f"{saat} sa {dakika} dk"
+        return f"{dakika} dk"
+
+    def farkli_pil_noktalari(self, kayitlar):
+        sonuc = []
+        son_pil = None
+        for zaman, pil, durum in kayitlar:
+            if pil != son_pil:
+                sonuc.append((zaman, pil, durum))
+                son_pil = pil
+        return sonuc
+
+    def sarj_tahmini_hesapla(self, pil):
+        sarj_kayitlari = [k for k in self.sarj_gecmisi if k[2] == int(BatteryState.POWER_SUPPLY_STATUS_CHARGING)]
+
+        if len(sarj_kayitlari) < 2:
+            return "Tahmin için veri toplanıyor"
+
+        farkli = self.farkli_pil_noktalari(sarj_kayitlari)
+        if len(farkli) < 2:
+            return "Şarj verisi toplanıyor"
+
+        ilk_zaman, ilk_pil, _ = farkli[0]
+        son_zaman, son_pil, _ = farkli[-1]
+
+        toplam_sure = son_zaman - ilk_zaman
+        toplam_artis = son_pil - ilk_pil
+
+        if toplam_sure <= 0 or toplam_artis <= 0:
+            return "Şarj tahmini hesaplanamadı"
+
+        saniye_basi_yuzde = toplam_sure / toplam_artis
+        kalan_yuzde = 100 - pil
+        kalan_saniye = kalan_yuzde * saniye_basi_yuzde
+
+        return f"Tahmini dolum: {self.zamani_formatla(kalan_saniye)}"
+
+    def bitis_tahmini_hesapla(self, pil):
+        pil_kayitlari = [
+            k for k in self.sarj_gecmisi
+            if k[2] not in (
+                int(BatteryState.POWER_SUPPLY_STATUS_CHARGING),
+                int(BatteryState.POWER_SUPPLY_STATUS_FULL),
+            )
+        ]
+
+        if len(pil_kayitlari) < 2:
+            return "Tahmin için veri toplanıyor"
+
+        farkli = self.farkli_pil_noktalari(pil_kayitlari)
+        if len(farkli) < 2:
+            return "Kullanım verisi toplanıyor"
+
+        ilk_zaman, ilk_pil, _ = farkli[0]
+        son_zaman, son_pil, _ = farkli[-1]
+
+        toplam_sure = son_zaman - ilk_zaman
+        harcanan_pil = ilk_pil - son_pil
+
+        if toplam_sure <= 0 or harcanan_pil <= 0:
+            return "Kullanım tahmini hesaplanamadı"
+
+        saniye_basi_yuzde = toplam_sure / harcanan_pil
+        kalan_saniye = pil * saniye_basi_yuzde
+
+        return f"Tahmini kullanım: {self.zamani_formatla(kalan_saniye)}"
+
+    def bluetooth_uyari_kontrol(self, pil, durum):
+        if durum == BatteryState.POWER_SUPPLY_STATUS_CHARGING:
+            self.uyari_verildi.clear()
+            return None
+
+        if durum == BatteryState.POWER_SUPPLY_STATUS_FULL or pil >= 100:
+            return None
+
+        for esik in UYARI_ESIKLERI:
+            if pil <= esik and esik not in self.uyari_verildi:
+                self.uyari_verildi.add(esik)
+                if esik == 30:
+                    return "Pil düşük (%30)"
+                elif esik == 15:
+                    return "Pil çok düşük (%15)"
+                elif esik == 5:
+                    return "Pil kritik (%5)"
+        return None
+
+    def guncelle(self):
+        with self.lock:
+            try:
+                self.baglan()
+                pil, durum = self.pil_ve_durum_oku()
+                simdi = time.time()
+
+                degisim_var = (pil != self.son_pil) or (durum != self.son_durum)
+
+                self.loga_ekle(simdi, pil, durum, zorla=degisim_var)
+                self.eski_kayitlari_ayikla(simdi)
+
+                uyari = self.bluetooth_uyari_kontrol(pil, durum)
+                if uyari:
+                    self.bekleyen_uyari = uyari
+
+                self.son_pil = pil
+                self.son_durum = durum
+
+            except Exception:
+                self.kapat()
+
+    def anlik_durum_verisi(self):
+        with self.lock:
+            self.baglan()
+            pil, durum = self.pil_ve_durum_oku()
+
+            if durum == BatteryState.POWER_SUPPLY_STATUS_CHARGING:
+                tahmin = self.sarj_tahmini_hesapla(pil)
+            elif durum == BatteryState.POWER_SUPPLY_STATUS_FULL or pil >= 100:
+                tahmin = "Tahmini dolum: 0 dk"
+            else:
+                tahmin = self.bitis_tahmini_hesapla(pil)
+
+            return {
+                "pil": pil,
+                "durum": durum,
+                "durum_metni": self.durum_metni(durum, pil),
+                "baglanti_metni": self.baglanti_metni(durum, pil),
+                "tahmin": tahmin,
+                "kayit_sayisi": len(self.sarj_gecmisi),
+                "enum_adi": self.enum_adi(durum),
+            }
+
+    def bekleyen_uyariyi_al(self):
+        with self.lock:
+            uyari = self.bekleyen_uyari
+            self.bekleyen_uyari = None
+            return uyari
+
+
+def main():
+    monitor = DualSenseMonitor()
+    ui = BatteryNotificationUI(monitor, bildirim_suresi=BILDIRIM_SURESI)
+
+    if DEBUG:
+        terminali_temizle()
+        print("=" * 54)
+        print("🎮 DUALSENSE HOTKEY BİLDİRİM SİSTEMİ")
+        print("=" * 54)
+        print(f"{HOTKEY_DURUM}  -> bildirim aç")
+        print(f"{HOTKEY_TEMIZLE}  -> log temizle")
+        print(f"{HOTKEY_CIKIS} -> çıkış")
+        print(f"Log dosyası: {os.path.abspath(LOG_DOSYASI)}")
+        print("=" * 54)
+
+    keyboard.add_hotkey(HOTKEY_DURUM, lambda: ui.root.after(0, ui.durum_goster))
+    keyboard.add_hotkey(HOTKEY_TEMIZLE, lambda: (monitor.log_temizle(), ui.root.after(0, ui.log_temizlendi_bildirimi)))
+    keyboard.add_hotkey(HOTKEY_CIKIS, lambda: ui.root.after(0, ui.root.quit))
+
+    def arka_plan_guncelle():
+        while True:
+            try:
+                monitor.guncelle()
+                uyari = monitor.bekleyen_uyariyi_al()
+                if uyari:
+                    ui.root.after(0, ui.durum_goster)
+                time.sleep(GUNCELLEME_ARALIGI)
+            except Exception:
+                time.sleep(GUNCELLEME_ARALIGI)
+
+    thread = threading.Thread(target=arka_plan_guncelle, daemon=True)
+    thread.start()
+
+    ui.root.mainloop()
+    monitor.kapat()
+
 
 if __name__ == "__main__":
-    DualSenseHUD()
+    main()
